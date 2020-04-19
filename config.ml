@@ -228,6 +228,9 @@ let conduit_ = conduit_direct ~tls:true stack
 let http_srv = cohttp_server conduit_
 let http_cli = cohttp_client (resolver_dns stack) conduit_
 
+let certs_key = Key.(value @@ kv_ro ~group:"certs" ())
+let certs = generic_kv_ro ~key:certs_key "tls"
+
 let () =
   let keys = Key.([
       abstract hook; abstract remote;
@@ -242,9 +245,10 @@ let () =
       ~keys
       ~packages
       "Unikernel.Main"
-      (mimic @-> http_client @-> http @-> pclock @-> time @-> job)
+      (mimic @-> http_client @-> http @-> pclock @-> time @-> kv_ro @-> job)
     $ mimic_impl
     $ http_cli $ http_srv
     $ default_posix_clock
     $ default_time
+    $ certs
   ]

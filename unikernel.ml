@@ -2,9 +2,23 @@ open Lwt.Infix
 
 let argument_error = 64
 
-module Main (_ : sig end) (Http_client: Cohttp_lwt.S.Client) (Http: Cohttp_mirage.Server.S) (C: Mirage_clock.PCLOCK) (Time: Mirage_time.S) = struct
+module Main (_ : sig end) (Http_client: Cohttp_lwt.S.Client) (Http: Cohttp_mirage.Server.S) (C: Mirage_clock.PCLOCK) (Time: Mirage_time.S) (KEYS: Mirage_kv.RO) = struct
   module Store = Irmin_mirage_git.Mem.KV(Irmin.Contents.String)
   module Sync = Irmin.Sync(Store)
+
+  module X509KV = Tls_mirage.X509(KEYS)(Pclock)
+
+  let tls_from_kv kv =
+    Lwt.catch
+      (fun () ->
+         Logs.info (fun m -> m "now reading certificates from KV");
+         X509KV.certificate kv `Default >|= fun certs ->
+         Logs.info (fun m -> m "read certificates from KV");
+         Ok certs)
+      (fun e ->
+         Logs.info (fun m -> m "failed to read certificates from KV %s"
+                       (Printexc.to_string e));
+         Lwt.return (Error ()))
 
   module Last_modified = struct
     let ptime_to_http_date ptime =
@@ -204,7 +218,7 @@ module Main (_ : sig end) (Http_client: Cohttp_lwt.S.Client) (Http: Cohttp_mirag
     in
     Http.make ~conn_closed ~callback ()
 
-  let start ctx http_client http () () =
+  let start ctx http_client http () () keys =
     Remote.connect ctx >>= fun (store, upstream) ->
     Lwt.map
       (function Ok () -> Lwt.return_unit | Error (`Msg msg) -> Lwt.fail_with msg)
@@ -224,11 +238,32 @@ module Main (_ : sig end) (Http_client: Cohttp_lwt.S.Client) (Http: Cohttp_mirag
        in
        if Key_gen.tls () then begin
          let rec provision () =
-           Logs.info (fun m ->
-               m "listening on 80/HTTP (let's encrypt provisioning)");
-           (* this should be cancelled once certificates are retrieved *)
-           Lwt.async (fun () -> http (`TCP 80) (serve LE.dispatch));
-           LE.provision_certificate http_client >>= fun certificates ->
+           let now = Ptime.v (C.now_d_ps ()) in
+           begin
+             let open Lwt.Infix in
+             (* let's consider only certificates that are valid for at least one more day! *)
+             let than = match Ptime.add_span now (Ptime.Span.v (1, 0L)) with
+                 None -> now | Some n -> n
+             in
+             tls_from_kv keys >>= function
+             | Ok (server :: chain, priv) ->
+               let until = snd (X509.Certificate.validity server) in
+               let good = Ptime.is_later ~than until in
+               Logs.info (fun m -> m "certificate valid until %a, good %B"
+                              (Ptime.pp_rfc3339 ()) until good);
+               if good then
+                 Lwt.return (Ok (`Single (server :: chain, priv)))
+               else
+                 Lwt.return (Error (`Msg "certificate not good"))
+             | Ok ([], _) ->
+               Lwt.return (Error (`Msg "empty certificate chain"))
+             | Error () ->
+               Logs.info (fun m ->
+                   m "listening on 80/HTTP (let's encrypt provisioning)");
+               (* this should be cancelled once certificates are retrieved *)
+               Lwt.async (fun () -> http (`TCP 80) (serve LE.dispatch));
+               LE.provision_certificate http_client
+           end >>= fun certificates ->
            let tls_cfg = Tls.Config.server ~certificates () in
            let https_port = 443 in
            let tls = `TLS (tls_cfg, `TCP https_port) in
@@ -241,7 +276,17 @@ module Main (_ : sig end) (Http_client: Cohttp_lwt.S.Client) (Http: Cohttp_mirag
              let redirect = serve (Dispatch.redirect https_port) in
              http tcp redirect
            in
-           let expire = Time.sleep_ns (Duration.of_day 80) in
+           let expire =
+             let server_cert = match certificates with
+               | `Single (c :: _, _) -> c | _ -> assert false
+             in
+             let _, until = X509.Certificate.validity server_cert in
+             let diff = Ptime.diff until now in
+             let days, _ = Ptime.Span.to_d_ps diff in
+             (* invalidate a day before actual expiry *)
+             let expire = max 1 (pred days) in
+             Time.sleep_ns (Duration.of_day expire)
+           in
            Lwt_result.ok (Lwt.pick [ https; http; expire ]) >>= fun () ->
            provision ()
          in
