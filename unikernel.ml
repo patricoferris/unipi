@@ -2,7 +2,13 @@ open Lwt.Infix
 
 let argument_error = 64
 
-module Main (S: Mirage_stack.V4) (RES: Resolver_lwt.S) (CON: Conduit_mirage.S) (C: Mirage_clock.PCLOCK) (M: Mirage_clock.MCLOCK) (Time: Mirage_time.S) = struct
+module Main (S: Mirage_stack.V4V6) (C: Mirage_clock.PCLOCK) (M: Mirage_clock.MCLOCK) (Time: Mirage_time.S) (R : Mirage_random.S) = struct
+
+  module TCP = Conduit_mirage_tcp.Make(S)
+  module SSH = Awa_conduit.Make(Conduit_mirage.IO)(Conduit_mirage)(M)
+  module TLS = Conduit_tls.Make(Conduit_mirage.IO)(Conduit_mirage)
+
+  module RES = Conduit_mirage_dns.Make(R)(Time)(M)(S)
 
   module Http = Cohttp_mirage.Server_with_conduit
 
@@ -54,22 +60,6 @@ module Main (S: Mirage_stack.V4) (RES: Resolver_lwt.S) (CON: Conduit_mirage.S) (
   end
 
   module Remote = struct
-    let ssh_config () =
-      match Astring.String.cut ~sep:"://" (Key_gen.remote ()) with
-      | Some (pre, _) when Astring.String.is_infix ~affix:"ssh" pre ->
-        begin
-          match Key_gen.ssh_seed (), Key_gen.ssh_authenticator () with
-          | None, _ ->
-            Logs.err (fun m -> m "no ssh key seed provided, but ssh git remote");
-            exit argument_error
-          | Some seed, None ->
-            Logs.warn (fun m -> m "ssh server will not be authenticated");
-            Cohttp.Header.init_with "config" (seed ^ ":")
-          | Some seed, Some authenticator ->
-            Cohttp.Header.init_with "config" (seed ^ ":" ^ authenticator)
-        end
-      | _ -> Cohttp.Header.init ()
-
     let decompose_git_url () =
       match String.split_on_char '#' (Key_gen.remote ()) with
       | [ url ] -> url, None
@@ -78,15 +68,51 @@ module Main (S: Mirage_stack.V4) (RES: Resolver_lwt.S) (CON: Conduit_mirage.S) (
         Logs.err (fun m -> m "expected at most a single # in remote");
         exit argument_error
 
-    let connect resolver conduit =
+    let resolvers dns_resolver =
+      let remote, _ = decompose_git_url () in
+      match Smart_git.endpoint_of_string remote, Key_gen.ssh_seed () with
+      | Ok { Smart_git.scheme = `SSH user ; path ; _ }, Some key_seed ->
+        let authenticator = match Key_gen.ssh_authenticator () with
+          | None ->
+            Logs.warn (fun m -> m "ssh server will not be authenticated");
+            None
+          | Some x -> match Awa.Keys.authenticator_of_string x with
+            | Ok x -> Some x
+            | Error e ->
+              Logs.err (fun m -> m "ssh: %s" e);
+              exit argument_error
+        in
+        let key = Awa.Keys.of_seed key_seed in
+        (* TODO: what to do with '' in path? *)
+        let req = Awa.Ssh.Exec (Fmt.strf "git-upload-pack '%s'" path) in
+        let ssh_config = { Awa_conduit.user ; key ; req ; authenticator } in
+        let ssh_resolver hostname =
+          dns_resolver ~port:22 hostname >|= function
+          | Some edn -> Some (edn, ssh_config)
+          | None -> None
+        in
+        Conduit_mirage.add
+          (SSH.protocol_with_ssh TCP.protocol) ssh_resolver
+          (Conduit_mirage.add
+             TCP.protocol (dns_resolver ~port:9418)
+             Conduit_mirage.empty)
+      | Ok y, _ ->
+        Conduit_mirage.add
+          TCP.protocol (dns_resolver ~port:9418)
+          Conduit_mirage.empty
+      | Error (`Msg msg), _ ->
+        Logs.err (fun m -> m "git endpoint %s" msg);
+        exit argument_error
+
+    let connect dns =
       let uri, branch = decompose_git_url () in
       let config = Irmin_mem.config () in
       Store.Repo.v config >>= fun r ->
       (match branch with
        | None -> Store.master r
        | Some branch -> Store.of_branch r branch) >|= fun repo ->
-      let headers = ssh_config () in
-      repo, Store.remote ~headers ~conduit ~resolver uri
+      let resolvers = resolvers dns in
+      repo, Store.remote ~resolvers uri
 
     let pull store upstream =
       Logs.info (fun m -> m "pulling from remote!");
@@ -196,7 +222,7 @@ module Main (S: Mirage_stack.V4) (RES: Resolver_lwt.S) (CON: Conduit_mirage.S) (
         end
       | _ -> Http.respond ~status:`Not_found ~body:`Empty ()
 
-    let provision_certificate resolver conduit =
+    let provision_certificate dns_resolver =
       let open Lwt_result.Infix in
       let endpoint =
         if Key_gen.production () then
@@ -206,7 +232,11 @@ module Main (S: Mirage_stack.V4) (RES: Resolver_lwt.S) (CON: Conduit_mirage.S) (
       and email = Key_gen.email ()
       and seed = Key_gen.account_seed ()
       in
-      let ctx = Cohttp_mirage.Client.ctx resolver conduit in
+      let ctx =
+        Conduit_mirage.add
+          TCP.protocol (dns_resolver ~port:80)
+          Conduit_mirage.empty
+      in
       Acme.initialise ~ctx ~endpoint ?email (gen_rsa ?seed ()) >>= fun le ->
       let sleep sec = Time.sleep_ns (Duration.of_sec sec) in
       let priv, csr = csr (Key_gen.cert_seed ()) (Key_gen.hostname ()) in
@@ -221,10 +251,15 @@ module Main (S: Mirage_stack.V4) (RES: Resolver_lwt.S) (CON: Conduit_mirage.S) (
     in
     Http.make ~conn_closed ~callback ()
 
-  let start _stack resolver conduit () () () =
-    CON.with_ssh conduit (module M) >>= fun ssh_conduit ->
-    Http.connect conduit >>= fun http ->
-    Remote.connect resolver ssh_conduit >>= fun (store, upstream) ->
+  let start stack () () () () =
+    let dns = RES.create stack in
+    let dns_resolver ~port =
+      RES.resolv stack ?keepalive:None dns ?nameserver:None ~port
+    in
+    Remote.connect dns_resolver >>= fun (store, upstream) ->
+    Http.connect TCP.protocol TCP.service >>= fun http ->
+    let tls_protocol = TLS.protocol_with_tls TCP.protocol in
+    Http.connect tls_protocol (TLS.service_with_tls TCP.service tls_protocol) >>= fun https ->
     Lwt.map
       (function Ok () -> Lwt.return_unit | Error (`Msg msg) -> Lwt.fail_with msg)
       (let open Lwt_result.Infix in
@@ -241,23 +276,24 @@ module Main (S: Mirage_stack.V4) (RES: Resolver_lwt.S) (CON: Conduit_mirage.S) (
            let hookf () = Remote.pull store upstream in
            serve (Dispatch.dispatch store hookf hook_url)
        in
+       let port = 80 in
+       let tcp = Conduit_mirage_tcp.{ stack ; keepalive = None ; nodelay = false ; port = 80 } in
        if Key_gen.tls () then begin
          let rec provision () =
            Logs.info (fun m ->
-               m "listening on 80/HTTP (let's encrypt provisioning)");
+               m "listening on HTTP for let's encrypt provisioning");
            (* this should be cancelled once certificates are retrieved *)
-           Lwt.async (fun () -> http (`TCP 80) (serve LE.dispatch));
-           LE.provision_certificate resolver conduit >>= fun certificates ->
+           Lwt.async (fun () -> http tcp (serve LE.dispatch));
+           LE.provision_certificate dns_resolver >>= fun certificates ->
            let tls_cfg = Tls.Config.server ~certificates () in
-           let https_port = 443 in
-           let tls = `TLS (tls_cfg, `TCP https_port) in
+           let port = 443 in
+           let tls = Conduit_mirage_tcp.{ stack ; keepalive = None ; nodelay = false ; port } in
            let https =
-             Logs.info (fun f -> f "listening on %d/HTTPS" https_port);
-             http tls server
+             Logs.info (fun f -> f "listening on HTTPS port");
+             https (tls, tls_cfg) server
            and http =
-             Logs.info (fun f -> f "listening on %d/HTTP, redirecting to %d/HTTPS"
-                           http_port https_port);
-             let redirect = serve (Dispatch.redirect https_port) in
+             Logs.info (fun f -> f "listening on HTTP, redirecting to HTTPS");
+             let redirect = serve (Dispatch.redirect port) in
              http tcp redirect
            in
            let expire = Time.sleep_ns (Duration.of_day 80) in
@@ -266,7 +302,7 @@ module Main (S: Mirage_stack.V4) (RES: Resolver_lwt.S) (CON: Conduit_mirage.S) (
          in
          provision ()
        end else begin
-         Logs.info (fun f -> f "listening on %d/HTTP" http_port);
+         Logs.info (fun f -> f "listening on HTTP");
          Lwt_result.ok (http tcp server)
        end)
 end

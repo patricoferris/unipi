@@ -48,10 +48,6 @@ let email =
   let doc = Key.Arg.info ~doc:"Let's encrypt E-Mail." ["email"] in
   Key.(create "email" Arg.(opt (some string) None doc))
 
-let awa_pin = "git+https://github.com/hannesm/awa-ssh.git#future"
-and git_pin = "git+https://github.com/hannesm/ocaml-git.git#awa-future"
-and conduit_pin = "git+https://github.com/hannesm/ocaml-conduit.git#awa-future"
-
 let packages = [
   package ~min:"2.0.0" "irmin";
   package ~min:"2.0.0" "irmin-mirage";
@@ -60,20 +56,15 @@ let packages = [
   package "tls-mirage";
   package "magic-mime";
   package "logs";
-  package ~pin:awa_pin "awa";
-  package ~pin:awa_pin "awa-mirage";
-  package ~pin:conduit_pin "conduit";
-  package ~pin:conduit_pin "conduit-lwt";
-  (* let's encrypt depends on cohttp-lwt-unix which depends on conduit-lwt-unix *)
-  package ~build:true ~pin:conduit_pin "conduit-lwt-unix";
-  package ~pin:conduit_pin "conduit-mirage";
-  package ~pin:git_pin "git";
-  package ~pin:git_pin "git-http";
-  package ~pin:git_pin "git-mirage";
+  package "awa-conduit";
+  package "conduit-tls";
+  package ~sublibs:["tcp";"dns"] "conduit-mirage";
+  package "git";
+  package "git-mirage";
   package "letsencrypt";
 ]
 
-let stack = generic_stackv4 default_network
+let stack = generic_stackv4v6 default_network
 
 let () =
   let keys = Key.([
@@ -89,11 +80,10 @@ let () =
       ~keys
       ~packages
       "Unikernel.Main"
-      (stackv4 @-> resolver @-> conduit @-> pclock @-> mclock @-> time @-> job)
+      (stackv4v6 @-> pclock @-> mclock @-> time @-> random @-> job)
     $ stack
-    $ resolver_dns stack
-    $ conduit_direct ~tls:true stack
     $ default_posix_clock
     $ default_monotonic_clock
     $ default_time
+    $ default_random
   ]
