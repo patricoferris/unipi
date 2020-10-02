@@ -282,8 +282,6 @@ module Main (S: Mirage_stack.V4V6) (C: Mirage_clock.PCLOCK) (M: Mirage_clock.MCL
       (let open Lwt_result.Infix in
        Remote.pull store upstream >>= fun data ->
        Logs.info (fun m -> m "store: %s" data);
-       let http_port = Key_gen.port () in
-       let tcp = `TCP http_port in
        let server =
          let hook_url = Key_gen.hook () in
          if Astring.String.is_infix ~affix:"/" hook_url then begin
@@ -293,14 +291,15 @@ module Main (S: Mirage_stack.V4V6) (C: Mirage_clock.PCLOCK) (M: Mirage_clock.MCL
            let hookf () = Remote.pull store upstream in
            serve (Dispatch.dispatch store hookf hook_url)
        in
-       let port = 80 in
-       let tcp = Conduit_mirage_tcp.{ stack ; keepalive = None ; nodelay = false ; port = 80 } in
+       let http_port = Key_gen.port () in
+       let tcp = Conduit_mirage_tcp.{ stack ; keepalive = None ; nodelay = false ; port = http_port } in
        if Key_gen.tls () then begin
          let rec provision () =
            Logs.info (fun m ->
-               m "listening on HTTP for let's encrypt provisioning");
+               m "listening on 80/HTTP for let's encrypt provisioning");
            (* this should be cancelled once certificates are retrieved *)
-           Lwt.async (fun () -> http tcp (serve LE.dispatch));
+           let le_tcp = Conduit_mirage_tcp.{ stack ; keepalive = None ; nodelay = false ; port = 80 } in
+           Lwt.async (fun () -> http le_tcp (serve LE.dispatch));
            LE.provision_certificate dns_resolver >>= fun certificates ->
            let tls_cfg = Tls.Config.server ~certificates () in
            let port = 443 in
@@ -309,7 +308,7 @@ module Main (S: Mirage_stack.V4V6) (C: Mirage_clock.PCLOCK) (M: Mirage_clock.MCL
              Logs.info (fun f -> f "listening on HTTPS port");
              https (tls, tls_cfg) server
            and http =
-             Logs.info (fun f -> f "listening on HTTP, redirecting to HTTPS");
+             Logs.info (fun f -> f "listening on %d/HTTP, redirecting to HTTPS" http_port);
              let redirect = serve (Dispatch.redirect port) in
              http tcp redirect
            in
@@ -319,7 +318,7 @@ module Main (S: Mirage_stack.V4V6) (C: Mirage_clock.PCLOCK) (M: Mirage_clock.MCL
          in
          provision ()
        end else begin
-         Logs.info (fun f -> f "listening on HTTP");
+         Logs.info (fun f -> f "listening on %d/HTTP" http_port);
          Lwt_result.ok (http tcp server)
        end)
 end
