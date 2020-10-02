@@ -93,9 +93,7 @@ module Main (S: Mirage_stack.V4V6) (C: Mirage_clock.PCLOCK) (M: Mirage_clock.MCL
         in
         Conduit_mirage.add
           (SSH.protocol_with_ssh TCP.protocol) ssh_resolver
-          (Conduit_mirage.add
-             TCP.protocol (dns_resolver ~port:9418)
-             Conduit_mirage.empty)
+          Conduit_mirage.empty
       | Ok y, _ ->
         Conduit_mirage.add
           TCP.protocol (dns_resolver ~port:9418)
