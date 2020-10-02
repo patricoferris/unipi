@@ -68,8 +68,20 @@ module Main (S: Mirage_stack.V4V6) (C: Mirage_clock.PCLOCK) (M: Mirage_clock.MCL
         Logs.err (fun m -> m "expected at most a single # in remote");
         exit argument_error
 
-    let resolvers dns_resolver =
+    let resolvers stack dns_resolver =
       let remote, _ = decompose_git_url () in
+      let resolver, remote =
+        let uri = Uri.of_string remote in
+        match Uri.host uri with
+        | None -> dns_resolver, remote
+        | Some host -> match Ipaddr.of_string host with
+          | Ok ip ->
+            (fun ~port _ ->
+               let tcp = Conduit_mirage_tcp.{ stack ; keepalive = None ; nodelay = false ; ip ; port } in
+               Lwt.return (Some tcp)),
+            Uri.(to_string (with_host uri (Some "reserved")))
+          | Error _ -> dns_resolver, remote
+      in
       match Smart_git.endpoint_of_string remote, Key_gen.ssh_seed () with
       | Ok { Smart_git.scheme = `SSH user ; path ; _ }, Some key_seed ->
         let authenticator = match Key_gen.ssh_authenticator () with
@@ -87,29 +99,31 @@ module Main (S: Mirage_stack.V4V6) (C: Mirage_clock.PCLOCK) (M: Mirage_clock.MCL
         let req = Awa.Ssh.Exec (Fmt.strf "git-upload-pack '%s'" path) in
         let ssh_config = { Awa_conduit.user ; key ; req ; authenticator } in
         let ssh_resolver hostname =
-          dns_resolver ~port:22 hostname >|= function
+          resolver ~port:22 hostname >|= function
           | Some edn -> Some (edn, ssh_config)
           | None -> None
         in
+        remote,
         Conduit_mirage.add
           (SSH.protocol_with_ssh TCP.protocol) ssh_resolver
           Conduit_mirage.empty
       | Ok y, _ ->
+        remote,
         Conduit_mirage.add
-          TCP.protocol (dns_resolver ~port:9418)
+          TCP.protocol (resolver ~port:9418)
           Conduit_mirage.empty
       | Error (`Msg msg), _ ->
         Logs.err (fun m -> m "git endpoint %s" msg);
         exit argument_error
 
-    let connect dns =
-      let uri, branch = decompose_git_url () in
+    let connect stack dns =
+      let _, branch = decompose_git_url () in
       let config = Irmin_mem.config () in
       Store.Repo.v config >>= fun r ->
       (match branch with
        | None -> Store.master r
        | Some branch -> Store.of_branch r branch) >|= fun repo ->
-      let resolvers = resolvers dns in
+      let uri, resolvers = resolvers stack dns in
       repo, Store.remote ~resolvers uri
 
     let pull store upstream =
@@ -254,7 +268,7 @@ module Main (S: Mirage_stack.V4V6) (C: Mirage_clock.PCLOCK) (M: Mirage_clock.MCL
     let dns_resolver ~port =
       RES.resolv stack ?keepalive:None dns ?nameserver:None ~port
     in
-    Remote.connect dns_resolver >>= fun (store, upstream) ->
+    Remote.connect stack dns_resolver >>= fun (store, upstream) ->
     Http.connect TCP.protocol TCP.service >>= fun http ->
     let tls_protocol = TLS.protocol_with_tls TCP.protocol in
     Http.connect tls_protocol (TLS.service_with_tls TCP.service tls_protocol) >>= fun https ->
