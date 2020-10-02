@@ -8,6 +8,9 @@ module Main (S: Mirage_stack.V4V6) (C: Mirage_clock.PCLOCK) (M: Mirage_clock.MCL
   module SSH = Awa_conduit.Make(Conduit_mirage.IO)(Conduit_mirage)(M)
   module TLS = Conduit_tls.Make(Conduit_mirage.IO)(Conduit_mirage)
 
+  let ssh_protocol = SSH.protocol_with_ssh TCP.protocol
+  let tls_protocol = TLS.protocol_with_tls TCP.protocol
+
   module RES = Conduit_mirage_dns.Make(R)(Time)(M)(S)
 
   module Http = Cohttp_mirage.Server_with_conduit
@@ -104,9 +107,7 @@ module Main (S: Mirage_stack.V4V6) (C: Mirage_clock.PCLOCK) (M: Mirage_clock.MCL
           | None -> None
         in
         remote, branch,
-        Conduit_mirage.add
-          (SSH.protocol_with_ssh TCP.protocol) ssh_resolver
-          Conduit_mirage.empty
+        Conduit_mirage.add ssh_protocol ssh_resolver Conduit_mirage.empty
       | Ok y, _ ->
         remote, branch,
         Conduit_mirage.add
@@ -234,7 +235,6 @@ module Main (S: Mirage_stack.V4V6) (C: Mirage_clock.PCLOCK) (M: Mirage_clock.MCL
       | _ -> Http.respond ~status:`Not_found ~body:`Empty ()
 
     let provision_certificate dns_resolver =
-      let open Lwt_result.Infix in
       let endpoint =
         if Key_gen.production () then
           Letsencrypt.letsencrypt_production_url
@@ -243,11 +243,18 @@ module Main (S: Mirage_stack.V4V6) (C: Mirage_clock.PCLOCK) (M: Mirage_clock.MCL
       and email = Key_gen.email ()
       and seed = Key_gen.account_seed ()
       in
-      let ctx =
-        Conduit_mirage.add
-          TCP.protocol (dns_resolver ~port:80)
-          Conduit_mirage.empty
+      let tls_config =
+        (* TODO actually verify certificate *)
+        let authenticator ~host:_ _ = Ok None in
+        Tls.Config.client ~authenticator ()
       in
+      let resolver name =
+        dns_resolver ~port:443 name >|= function
+        | Some edn -> Some (edn, tls_config)
+        | None -> None
+      in
+      let ctx = Conduit_mirage.add tls_protocol resolver Conduit_mirage.empty in
+      let open Lwt_result.Infix in
       Acme.initialise ~ctx ~endpoint ?email (gen_rsa ?seed ()) >>= fun le ->
       let sleep sec = Time.sleep_ns (Duration.of_sec sec) in
       let priv, csr = csr (Key_gen.cert_seed ()) (Key_gen.hostname ()) in
@@ -269,7 +276,6 @@ module Main (S: Mirage_stack.V4V6) (C: Mirage_clock.PCLOCK) (M: Mirage_clock.MCL
     in
     Remote.connect stack dns_resolver >>= fun (store, upstream) ->
     Http.connect TCP.protocol TCP.service >>= fun http ->
-    let tls_protocol = TLS.protocol_with_tls TCP.protocol in
     Http.connect tls_protocol (TLS.service_with_tls TCP.service tls_protocol) >>= fun https ->
     Lwt.map
       (function Ok () -> Lwt.return_unit | Error (`Msg msg) -> Lwt.fail_with msg)
