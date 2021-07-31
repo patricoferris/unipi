@@ -1,114 +1,31 @@
 open Lwt.Infix
-
 let argument_error = 64
 
-module Main (_ : sig end) (Http_client: Cohttp_lwt.S.Client) (Http: Cohttp_mirage.Server.S) (C: Mirage_clock.PCLOCK) (Time: Mirage_time.S) = struct
-  module Store = Irmin_mirage_git.Mem.KV(Irmin.Contents.String)
-  module Sync = Irmin.Sync(Store)
+module Main (_ : sig end) (Http_client: Cohttp_lwt.S.Client) (Http: Cohttp_mirage.Server.S) (FS: Mirage_kv.RO) (C: Mirage_clock.PCLOCK) (Time: Mirage_time.S) = struct
 
-  module Last_modified = struct
-    let ptime_to_http_date ptime =
-      let (y, m, d), ((hh, mm, ss), _) = Ptime.to_date_time ptime
-      and weekday = match Ptime.weekday ptime with
-        | `Mon -> "Mon" | `Tue -> "Tue" | `Wed -> "Wed" | `Thu -> "Thu"
-        | `Fri -> "Fri" | `Sat -> "Sat" | `Sun -> "Sun"
-      and month =
-        [| "Jan" ; "Feb" ; "Mar" ; "Apr" ; "May" ; "Jun" ;
-           "Jul" ; "Aug" ; "Sep" ; "Oct" ; "Nov" ; "Dec" |]
-    in
-    let m' = Array.get month (pred m) in
-    Printf.sprintf "%s, %02d %s %04d %02d:%02d:%02d GMT" weekday d m' y hh mm ss
-
-    (* cache the last commit (last modified and last hash) *)
-    let last = ref ("", "")
-
-    (* cache control: all resources use last-modified + etag of last commit *)
-    let retrieve_last_commit store =
-      Store.Head.get store >|= fun head ->
-      let last_commit_date =
-        let info = Store.Commit.info head in
-        let ptime =
-          match Ptime.of_float_s (Int64.to_float (Irmin.Info.date info)) with
-          | None -> Ptime.v (C.now_d_ps ())
-          | Some d -> d
-        in
-        ptime_to_http_date ptime
-      and last_commit_hash =
-        Fmt.to_to_string (Irmin.Type.pp Store.Hash.t) (Store.Commit.hash head)
-      in
-      last := (last_commit_date, last_commit_hash)
-
-    let not_modified request =
-      let hdr = request.Cohttp.Request.headers in
-      match Cohttp.Header.get hdr "if-modified-since" with
-      | Some ts -> String.equal ts (fst !last)
-      | None -> match Cohttp.Header.get hdr "if-none-match" with
-        | Some etags -> List.mem (snd !last) (Astring.String.cuts ~sep:"," etags)
-        | None -> false
-
-    let last_modified () = fst !last
-    let etag () = snd !last
-  end
-
-  module Remote = struct
-    let decompose_git_url () =
-      match String.split_on_char '#' (Key_gen.remote ()) with
-      | [ url ] -> url, None
-      | [ url ; branch ] -> url, Some branch
-      | _ ->
-        Logs.err (fun m -> m "expected at most a single # in remote");
-        exit argument_error
-
-    let connect ctx =
-      let uri, branch = decompose_git_url () in
-      let config = Irmin_mem.config () in
-      Store.Repo.v config >>= fun r ->
-      (match branch with
-       | None -> Store.master r
-       | Some branch -> Store.of_branch r branch) >|= fun repo ->
-      repo, Store.remote ~ctx uri
-
-    let pull store upstream =
-      Logs.info (fun m -> m "pulling from remote!");
-      Sync.pull ~depth:1 store upstream `Set >>= fun r ->
-      Last_modified.retrieve_last_commit store >|= fun () ->
-      match r with
-      | Ok (`Head _ as s) -> Ok (Fmt.strf "pulled %a" Sync.pp_status s)
-      | Ok `Empty -> Error (`Msg "pulled empty repository")
-      | Error (`Msg e) -> Error (`Msg ("pull error " ^ e))
-      | Error (`Conflict msg) -> Error (`Msg ("pull conflict " ^ msg))
-  end
-
+  let fs_read dev name =
+    FS.get dev (Mirage_kv.Key.v name) >|= function
+    | Ok data -> Some data
+    | Error e -> 
+      Logs.warn (fun f -> f "%a" FS.pp_error e);
+      None
+  
   module Dispatch = struct
-    let dispatch store hookf hook_url request _body =
+    let dispatch store request _body =
       let p = Uri.path (Cohttp.Request.uri request) in
       let path = if String.equal p "/" then "index.html" else p in
       Logs.info (fun f -> f "requested %s" path);
-      match Astring.String.cuts ~sep:"/" ~empty:false path with
-      | [ h ] when String.equal hook_url h ->
-        begin
-          hookf () >>= function
-          | Ok data -> Http.respond ~status:`OK ~body:(`String data) ()
-          | Error (`Msg msg) ->
-            Http.respond ~status:`Internal_server_error ~body:(`String msg) ()
-        end
-      | path_list ->
-        if Last_modified.not_modified request then
-          Http.respond ~status:`Not_modified ~body:`Empty ()
-        else
-          Store.find store path_list >>= function
-          | Some data ->
-            let mime_type = Magic_mime.lookup path in
-            let headers = [
-              "content-type", mime_type ;
-              "etag", Last_modified.etag () ;
-              "last-modified", Last_modified.last_modified () ;
-            ] in
-            let headers = Cohttp.Header.of_list headers in
-            Http.respond ~headers ~status:`OK ~body:(`String data) ()
-          | None ->
-            let data = "Resource not found " ^ path in
-            Http.respond ~status:`Not_found ~body:(`String data) ()
+        fs_read store path >>= function
+        | Some data ->
+          let mime_type = Magic_mime.lookup path in
+          let headers = [
+            "content-type", mime_type ;
+          ] in
+          let headers = Cohttp.Header.of_list headers in
+          Http.respond ~headers ~status:`OK ~body:(`String data) ()
+        | None ->
+          let data = "Resource not found " ^ path in
+          Http.respond ~status:`Not_found ~body:(`String data) ()
 
     let redirect port request _body =
       let uri = Cohttp.Request.uri request in
@@ -204,23 +121,14 @@ module Main (_ : sig end) (Http_client: Cohttp_lwt.S.Client) (Http: Cohttp_mirag
     in
     Http.make ~conn_closed ~callback ()
 
-  let start ctx http_client http () () =
-    Remote.connect ctx >>= fun (store, upstream) ->
+  let start ctx http_client http store () () =
     Lwt.map
       (function Ok () -> Lwt.return_unit | Error (`Msg msg) -> Lwt.fail_with msg)
       (let open Lwt_result.Infix in
-       Remote.pull store upstream >>= fun data ->
-       Logs.info (fun m -> m "store: %s" data);
        let http_port = Key_gen.port () in
        let tcp = `TCP http_port in
        let server =
-         let hook_url = Key_gen.hook () in
-         if Astring.String.is_infix ~affix:"/" hook_url then begin
-           Logs.err (fun m -> m "hook url contains /, which is not allowed");
-           exit argument_error
-         end else
-           let hookf () = Remote.pull store upstream in
-           serve (Dispatch.dispatch store hookf hook_url)
+         serve (Dispatch.dispatch store)
        in
        if Key_gen.tls () then begin
          let rec provision () =

@@ -148,18 +148,8 @@ let mimic_paf_impl time pclock stackv4v6 paf mimic_tcp =
   $ mimic_tcp
 (* --- end of copied code --- *)
 
-let hook =
-  let doc = Key.Arg.info ~doc:"Webhook (no / allowed)." ["hook"] in
-  Key.(create "hook" Arg.(opt string "hook" doc))
-
-let remote =
-  let doc = Key.Arg.info
-      ~doc:"Remote repository url, use suffix #foo to specify a branch 'foo': \
-            https://github.com/hannesm/unipi.git#gh-pages"
-      ["remote"]
-  in
-  Key.(create "remote" Arg.(required string doc))
-
+let fs_key = Key.(value @@ kv_ro ())
+let filesfs = generic_kv_ro ~key:fs_key "../files"
 let port =
   let doc = Key.Arg.info ~doc:"HTTP listen port." ["port"] in
   Key.(create "port" Arg.(opt int 80 doc))
@@ -197,9 +187,6 @@ let email =
   Key.(create "email" Arg.(opt (some string) None doc))
 
 let packages = [
-  package ~min:"2.6.0" "irmin";
-  package ~min:"2.6.0" "irmin-mirage";
-  package ~min:"2.6.0" "irmin-mirage-git";
   package "cohttp-mirage";
   package "tls-mirage";
   package "magic-mime";
@@ -227,10 +214,8 @@ let mimic_impl =
 let conduit_ = conduit_direct ~tls:true stack
 let http_srv = cohttp_server conduit_
 let http_cli = cohttp_client (resolver_dns stack) conduit_
-
 let () =
   let keys = Key.([
-      abstract hook; abstract remote;
       abstract port; abstract tls;
       abstract ssh_seed; abstract ssh_authenticator;
       abstract hostname; abstract production; abstract cert_seed;
@@ -242,9 +227,10 @@ let () =
       ~keys
       ~packages
       "Unikernel.Main"
-      (mimic @-> http_client @-> http @-> pclock @-> time @-> job)
+      (mimic @-> http_client @-> http @-> kv_ro @-> pclock @-> time @-> job)
     $ mimic_impl
     $ http_cli $ http_srv
+    $ filesfs
     $ default_posix_clock
     $ default_time
   ]
